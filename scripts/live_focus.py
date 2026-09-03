@@ -37,7 +37,7 @@ def generate_mjpeg():
             + frame
             + b"\r\n"
         )
-        # Optional: cap FPS slightly
+        # Optional: slight FPS cap
         # time.sleep(0.03)
 
 
@@ -108,15 +108,30 @@ HTML = """<!doctype html>
       border: 1px solid #333;
       background: #1a1a1a;
       padding: 0.5rem;
-      margin-bottom: 0.5rem;
+      margin-bottom: 0.75rem;
       border-radius: 6px;
     }
     .result-part {
       font-weight: bold;
       color: #60a5fa;
+      margin-bottom: 0.25rem;
     }
     .result-conf {
       color: #fbbf24;
+      margin-top: 0.25rem;
+    }
+    .colors-title {
+      margin-top: 0.5rem;
+      font-size: 0.85rem;
+      color: #ccc;
+    }
+    .color-item {
+      display: inline-block;
+      margin: 0.25rem 0.5rem 0.25rem 0;
+      padding: 0.2rem 0.4rem;
+      border-radius: 4px;
+      border: 1px solid #444;
+      font-size: 0.85rem;
     }
     a {
       color: #60a5fa;
@@ -207,11 +222,23 @@ HTML = """<!doctype html>
               const link = p.bricklink_url
                 ? `<a href="${p.bricklink_url}" target="_blank">BrickLink</a>`
                 : "";
+
+              let colorsHtml = "";
+              if (p.colors && p.colors.length > 0) {
+                colorsHtml = "<div class='colors-title'>Colors:</div>";
+                p.colors.forEach(c => {
+                  const name = c.name || "Unknown";
+                  const score = ((c.score || 0) * 100).toFixed(1);
+                  colorsHtml += `<span class='color-item'>${name} (${score}%)</span>`;
+                });
+              }
+
               html += `<div class='result-item'>
                 <div class='result-part'>Part: ${p.id} ${link ? "(" + link + ")" : ""}</div>
                 <div>Name: ${p.name}</div>
                 <div>Category: ${p.category}</div>
                 <div class='result-conf'>Score: ${(p.score * 100).toFixed(1)}%</div>
+                ${colorsHtml}
               </div>`;
             });
             resultsDiv.innerHTML = html;
@@ -287,14 +314,16 @@ def identify_lego():
         camera.capture_file(stream, format="jpeg")
         image_bytes = stream.getvalue()
 
-        # Send to Brickognize
+        # Send to Brickognize with color enabled
         files = {
             "query_image": ("image.jpg", image_bytes, "image/jpeg")
         }
         params = {
-            "predict_color": "false",
+            "predict_color": "true",
             "top_k_items": 5,
+            "top_k_colors": 5,
             "min_similarity_items": 0.5,
+            "min_similarity_colors": 0.2,
         }
 
         resp = requests.post(
@@ -306,6 +335,7 @@ def identify_lego():
         resp.raise_for_status()
         data = resp.json()
 
+        # Parse items and colors from response
         items = data.get("items") or []
         predictions = []
         for item in items:
@@ -315,12 +345,20 @@ def identify_lego():
                     bricklink_url = site.get("url")
                     break
 
+            colors = []
+            for c in (item.get("colors") or []):
+                colors.append({
+                    "name": c.get("name", "Unknown"),
+                    "score": float(c.get("score", 0)),
+                })
+
             predictions.append({
                 "id": item.get("id", ""),
                 "name": item.get("name", ""),
                 "category": item.get("category", ""),
                 "score": float(item.get("score", 0)),
                 "bricklink_url": bricklink_url,
+                "colors": colors,
             })
 
         return jsonify({"ok": True, "predictions": predictions})
