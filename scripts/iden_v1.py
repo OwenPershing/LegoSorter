@@ -6,8 +6,8 @@ import requests
 
 app = Flask(__name__)
 
-# Brickognize endpoint (from docs)
-BRICKOGNIZE_URL = "https://api.brickognize.com/v1/items/predict"
+# Exact Brickognize endpoint from docs
+BRICKOGNIZE_URL = "https://api.brickognize.com/predict/"
 
 camera = Picamera2()
 camera.configure(
@@ -208,8 +208,9 @@ def identify():
             "query_image": ("image.jpg", latest_image_bytes, "image/jpeg")
         }
         params = {
-            "top_k_items": 5,        # top 5 predictions
-            "predict_color": "false"
+            "predict_color": "false",
+            "top_k_items": 5,
+            "min_similarity_items": 0.5,
         }
 
         resp = requests.post(
@@ -221,7 +222,7 @@ def identify():
         resp.raise_for_status()
         data = resp.json()
 
-        # Parse Brickognize response:
+        # Expected response shape (from docs):
         # {
         #   "listing_id": "...",
         #   "bounding_box": {...},
