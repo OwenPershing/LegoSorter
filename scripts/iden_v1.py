@@ -1,4 +1,4 @@
-from flask import Flask, Response, request, jsonify, render_template_string
+from flask import Flask, Response, render_template_string, jsonify
 from picamera2 import Picamera2
 import io
 import time
@@ -6,13 +6,8 @@ import requests
 
 app = Flask(__name__)
 
-# ----- CONFIGURE THIS -----
-# Brickognize API base URL – check https://api.brickognize.com/docs
-BRICKOGNIZE_URL = "https://api.brickognize.com/v1/predict"  # example; adjust if docs differ
-# If they require a key, add headers like:
-# BRICKOGNIZE_HEADERS = {"Authorization": "Bearer YOUR_KEY"}
-BRICKOGNIZE_HEADERS = {}
-# --------------------------
+# Brickognize endpoint (from docs)
+BRICKOGNIZE_URL = "https://api.brickognize.com/v1/items/predict"
 
 camera = Picamera2()
 camera.configure(
@@ -33,7 +28,7 @@ def capture_latest():
     latest_image_bytes = stream.getvalue()
 
 
-# Initial image so page isn't empty
+# Take an initial image so the page isn't empty on first load
 capture_latest()
 
 
@@ -110,6 +105,13 @@ HTML_PAGE = """<!doctype html>
     .result-conf {
       color: #fbbf24;
     }
+    a {
+      color: #60a5fa;
+      text-decoration: none;
+    }
+    a:hover {
+      text-decoration: underline;
+    }
   </style>
 </head>
 <body>
@@ -148,10 +150,14 @@ HTML_PAGE = """<!doctype html>
             }
             let html = "";
             data.predictions.forEach(p => {
+              const link = p.bricklink_url
+                ? `<a href="${p.bricklink_url}" target="_blank">BrickLink</a>`
+                : "";
               html += `<div class='result-item'>
-                <div class='result-part'>Part: ${p.part || "Unknown"}</div>
-                <div>Name: ${p.name || "Unknown"}</div>
-                <div class='result-conf'>Confidence: ${(p.confidence * 100).toFixed(1)}%</div>
+                <div class='result-part'>Part: ${p.id} ${link ? "(" + link + ")" : ""}</div>
+                <div>Name: ${p.name}</div>
+                <div>Category: ${p.category}</div>
+                <div class='result-conf'>Score: ${(p.score * 100).toFixed(1)}%</div>
               </div>`;
             });
             resultsDiv.innerHTML = html;
@@ -198,34 +204,57 @@ def identify():
         capture_latest()
 
         # 2. Send to Brickognize
-        files = {"file": ("image.jpg", latest_image_bytes, "image/jpeg")}
+        files = {
+            "query_image": ("image.jpg", latest_image_bytes, "image/jpeg")
+        }
+        params = {
+            "top_k_items": 5,        # top 5 predictions
+            "predict_color": "false"
+        }
+
         resp = requests.post(
             BRICKOGNIZE_URL,
-            headers=BRICKOGNIZE_HEADERS,
+            params=params,
             files=files,
             timeout=15,
         )
         resp.raise_for_status()
         data = resp.json()
 
-        # Adapt this to the actual JSON structure Brickognize returns.
-        # Common pattern: list of predictions with part id/name/score.
+        # Parse Brickognize response:
+        # {
+        #   "listing_id": "...",
+        #   "bounding_box": {...},
+        #   "items": [
+        #     {
+        #       "id": "3001",
+        #       "name": "Brick 2 x 4",
+        #       "img_url": "...",
+        #       "external_sites": [{"name": "bricklink", "url": "..."}],
+        #       "category": "Brick",
+        #       "type": "part",
+        #       "score": 0.9
+        #     },
+        #     ...
+        #   ]
+        # }
+
+        items = data.get("items") or []
         predictions = []
-        if isinstance(data, list):
-            for item in data[:5]:  # top 5
-                # Adjust field names to match docs
-                part = item.get("part") or item.get("part_id") or item.get("id", "")
-                name = item.get("name") or item.get("description", "")
-                conf = float(item.get("score") or item.get("confidence") or item.get("prob", 0))
-                predictions.append({"part": part, "name": name, "confidence": conf})
-        elif isinstance(data, dict):
-            # If they wrap predictions in a key like 'predictions'
-            raw = data.get("predictions") or data.get("results") or []
-            for item in raw[:5]:
-                part = item.get("part") or item.get("part_id") or item.get("id", "")
-                name = item.get("name") or item.get("description", "")
-                conf = float(item.get("score") or item.get("confidence") or item.get("prob", 0))
-                predictions.append({"part": part, "name": name, "confidence": conf})
+        for item in items:
+            bricklink_url = None
+            for site in (item.get("external_sites") or []):
+                if site.get("name") == "bricklink":
+                    bricklink_url = site.get("url")
+                    break
+
+            predictions.append({
+                "id": item.get("id", ""),
+                "name": item.get("name", ""),
+                "category": item.get("category", ""),
+                "score": float(item.get("score", 0)),
+                "bricklink_url": bricklink_url,
+            })
 
         return jsonify({"ok": True, "predictions": predictions})
 
