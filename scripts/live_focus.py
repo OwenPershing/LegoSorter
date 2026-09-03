@@ -3,6 +3,7 @@ from libcamera import controls
 from flask import Flask, Response, render_template_string, request, jsonify
 import io
 import time
+import requests
 
 app = Flask(__name__)
 
@@ -19,6 +20,9 @@ camera.set_controls({"AfMode": controls.AfModeEnum.Manual, "LensPosition": 0.0})
 
 min_focus, max_focus, _ = camera.camera_controls["LensPosition"]
 
+# Brickognize endpoint
+BRICKOGNIZE_URL = "https://api.brickognize.com/predict/"
+
 
 def generate_mjpeg():
     stream = io.BytesIO()
@@ -33,7 +37,7 @@ def generate_mjpeg():
             + frame
             + b"\r\n"
         )
-        # Small sleep if you want to cap FPS; remove for max FPS
+        # Optional: cap FPS slightly
         # time.sleep(0.03)
 
 
@@ -41,7 +45,7 @@ HTML = """<!doctype html>
 <html>
 <head>
   <meta charset="utf-8">
-  <title>Live Focus Test</title>
+  <title>Live Focus + Lego ID</title>
   <style>
     body {
       background: #111;
@@ -53,7 +57,7 @@ HTML = """<!doctype html>
     }
     img {
       max-width: 95vw;
-      max-height: 65vh;
+      max-height: 55vh;
       border: 1px solid #333;
       background: #000;
     }
@@ -93,10 +97,38 @@ HTML = """<!doctype html>
       font-size: 0.9rem;
       color: #aaa;
     }
+    .results {
+      margin-top: 1rem;
+      text-align: left;
+      max-width: 900px;
+      margin-left: auto;
+      margin-right: auto;
+    }
+    .result-item {
+      border: 1px solid #333;
+      background: #1a1a1a;
+      padding: 0.5rem;
+      margin-bottom: 0.5rem;
+      border-radius: 6px;
+    }
+    .result-part {
+      font-weight: bold;
+      color: #60a5fa;
+    }
+    .result-conf {
+      color: #fbbf24;
+    }
+    a {
+      color: #60a5fa;
+      text-decoration: none;
+    }
+    a:hover {
+      text-decoration: underline;
+    }
   </style>
 </head>
 <body>
-  <h1>Live Focus Test</h1>
+  <h1>Live Focus + Lego ID</h1>
   <img id="view" src="/feed" alt="Live camera feed">
   <div class="controls">
     <label>
@@ -107,12 +139,16 @@ HTML = """<!doctype html>
     <button id="afSingleBtn">Single AF</button>
     <button id="afContBtn">Continuous AF</button>
     <button id="afCancelBtn">Cancel AF</button>
+    <button id="legoBtn">Get Lego</button>
   </div>
   <div class="info" id="info">Ready.</div>
+  <div class="results" id="results"></div>
 
   <script>
     const lpInput = document.getElementById("lp");
     const info = document.getElementById("info");
+    const resultsDiv = document.getElementById("results");
+    const legoBtn = document.getElementById("legoBtn");
 
     function postJson(url, data) {
       return fetch(url, {
@@ -150,6 +186,45 @@ HTML = """<!doctype html>
           info.textContent = d.ok ? "Autofocus cancelled." : ("Error: " + d.error);
         });
     };
+
+    legoBtn.addEventListener("click", () => {
+      legoBtn.disabled = true;
+      info.textContent = "Identifying Lego...";
+      resultsDiv.innerHTML = "";
+
+      fetch("/identify_lego", { method: "POST" })
+        .then(r => r.json())
+        .then(data => {
+          legoBtn.disabled = false;
+          if (data.ok) {
+            info.textContent = "Identification complete.";
+            if (!data.predictions || data.predictions.length === 0) {
+              resultsDiv.innerHTML = "<div class='info'>No predictions returned.</div>";
+              return;
+            }
+            let html = "";
+            data.predictions.forEach(p => {
+              const link = p.bricklink_url
+                ? `<a href="${p.bricklink_url}" target="_blank">BrickLink</a>`
+                : "";
+              html += `<div class='result-item'>
+                <div class='result-part'>Part: ${p.id} ${link ? "(" + link + ")" : ""}</div>
+                <div>Name: ${p.name}</div>
+                <div>Category: ${p.category}</div>
+                <div class='result-conf'>Score: ${(p.score * 100).toFixed(1)}%</div>
+              </div>`;
+            });
+            resultsDiv.innerHTML = html;
+          } else {
+            info.textContent = "Error: " + (data.error || "Unknown error");
+          }
+        })
+        .catch(err => {
+          legoBtn.disabled = false;
+          info.textContent = "Error contacting server.";
+          console.error(err);
+        });
+    });
   </script>
 </body>
 </html>"""
@@ -200,6 +275,56 @@ def set_focus():
             return jsonify({"ok": True})
         else:
             return jsonify({"ok": False, "error": "Unknown mode"}), 400
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/identify_lego", methods=["POST"])
+def identify_lego():
+    try:
+        # Capture current frame to memory
+        stream = io.BytesIO()
+        camera.capture_file(stream, format="jpeg")
+        image_bytes = stream.getvalue()
+
+        # Send to Brickognize
+        files = {
+            "query_image": ("image.jpg", image_bytes, "image/jpeg")
+        }
+        params = {
+            "predict_color": "false",
+            "top_k_items": 5,
+            "min_similarity_items": 0.5,
+        }
+
+        resp = requests.post(
+            BRICKOGNIZE_URL,
+            params=params,
+            files=files,
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        items = data.get("items") or []
+        predictions = []
+        for item in items:
+            bricklink_url = None
+            for site in (item.get("external_sites") or []):
+                if site.get("name") == "bricklink":
+                    bricklink_url = site.get("url")
+                    break
+
+            predictions.append({
+                "id": item.get("id", ""),
+                "name": item.get("name", ""),
+                "category": item.get("category", ""),
+                "score": float(item.get("score", 0)),
+                "bricklink_url": bricklink_url,
+            })
+
+        return jsonify({"ok": True, "predictions": predictions})
+
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
