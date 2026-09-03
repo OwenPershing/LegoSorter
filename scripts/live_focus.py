@@ -2,7 +2,6 @@ from picamera2 import Picamera2
 from libcamera import controls
 from flask import Flask, Response, render_template_string, request, jsonify
 import io
-import threading
 import time
 
 app = Flask(__name__)
@@ -20,22 +19,22 @@ camera.set_controls({"AfMode": controls.AfModeEnum.Manual, "LensPosition": 0.0})
 
 min_focus, max_focus, _ = camera.camera_controls["LensPosition"]
 
-# For MJPEG streaming
-frame_lock = threading.Lock()
-latest_frame = None
 
-
-def capture_loop():
-    global latest_frame
+def generate_mjpeg():
+    stream = io.BytesIO()
     while True:
-        stream = io.BytesIO()
+        stream.seek(0)
         camera.capture_file(stream, format="jpeg")
-        with frame_lock:
-            latest_frame = stream.getvalue()
-        time.sleep(0.1)  # ~10 FPS
+        frame = stream.getvalue()
 
-
-threading.Thread(target=capture_loop, daemon=True).start()
+        yield (
+            b"--FRAME\r\n"
+            b"Content-Type: image/jpeg\r\n\r\n"
+            + frame
+            + b"\r\n"
+        )
+        # Small sleep if you want to cap FPS; remove for max FPS
+        # time.sleep(0.03)
 
 
 HTML = """<!doctype html>
@@ -165,19 +164,10 @@ def index():
 
 @app.route("/feed")
 def feed():
-    while True:
-        with frame_lock:
-            if latest_frame is not None:
-                return Response(
-                    latest_frame,
-                    mimetype="image/jpeg",
-                    headers={
-                        "Cache-Control": "no-cache, no-store, must-revalidate",
-                        "Pragma": "no-cache",
-                        "Expires": "0",
-                    },
-                )
-        time.sleep(0.05)
+    return Response(
+        generate_mjpeg(),
+        mimetype="multipart/x-mixed-replace; boundary=FRAME",
+    )
 
 
 @app.route("/set_focus", methods=["POST"])
