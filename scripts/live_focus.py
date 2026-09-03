@@ -4,13 +4,21 @@ from flask import Flask, Response, render_template_string, request, jsonify
 import io
 import time
 import requests
+import threading
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
 camera = Picamera2()
+
+# Use a modest resolution and a video-style config for stability
 camera.configure(
     camera.create_video_configuration(
-        main={"size": (1280, 720), "format": "RGB888"}
+        main={"size": (1280, 720), "format": "RGB888"},
+        queue=False,  # simpler pipeline
     )
 )
 camera.start()
@@ -23,22 +31,41 @@ min_focus, max_focus, _ = camera.camera_controls["LensPosition"]
 # Brickognize endpoint
 BRICKOGNIZE_URL = "https://api.brickognize.com/predict/"
 
+# Simple frame buffer for MJPEG
+frame_lock = threading.Lock()
+latest_frame = None
 
-def generate_mjpeg():
+
+def capture_loop():
+    global latest_frame
     stream = io.BytesIO()
     while True:
-        stream.seek(0)
-        camera.capture_file(stream, format="jpeg")
-        frame = stream.getvalue()
+        try:
+            stream.seek(0)
+            camera.capture_file(stream, format="jpeg")
+            data = stream.getvalue()
+            with frame_lock:
+                latest_frame = data
+        except Exception as e:
+            logger.warning("Capture error: %s", e)
+        # Small delay to keep the pipeline happy
+        time.sleep(0.05)
 
-        yield (
-            b"--FRAME\r\n"
-            b"Content-Type: image/jpeg\r\n\r\n"
-            + frame
-            + b"\r\n"
-        )
-        # Optional: slight FPS cap
-        # time.sleep(0.03)
+
+threading.Thread(target=capture_loop, daemon=True).start()
+
+
+def generate_mjpeg():
+    while True:
+        with frame_lock:
+            if latest_frame is not None:
+                yield (
+                    b"--FRAME\r\n"
+                    b"Content-Type: image/jpeg\r\n\r\n"
+                    + latest_frame
+                    + b"\r\n"
+                )
+        time.sleep(0.03)
 
 
 HTML = """<!doctype html>
@@ -279,23 +306,28 @@ def set_focus():
     try:
         if mode == "manual":
             lp = float(data.get("lens_position", 0))
+            # Give the pipeline a moment before changing controls
+            time.sleep(0.1)
             camera.set_controls({
                 "AfMode": controls.AfModeEnum.Manual,
                 "LensPosition": lp,
             })
             return jsonify({"ok": True})
         elif mode == "single":
+            time.sleep(0.1)
             camera.set_controls({
                 "AfMode": controls.AfModeEnum.Auto,
                 "AfTrigger": controls.AfTriggerEnum.Start,
             })
             return jsonify({"ok": True})
         elif mode == "continuous":
+            time.sleep(0.1)
             camera.set_controls({
                 "AfMode": controls.AfModeEnum.Continuous,
             })
             return jsonify({"ok": True})
         elif mode == "cancel":
+            time.sleep(0.1)
             camera.set_controls({
                 "AfMode": controls.AfModeEnum.Manual,
             })
@@ -303,6 +335,7 @@ def set_focus():
         else:
             return jsonify({"ok": False, "error": "Unknown mode"}), 400
     except Exception as e:
+        logger.exception("Focus error")
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
@@ -364,6 +397,7 @@ def identify_lego():
         return jsonify({"ok": True, "predictions": predictions})
 
     except Exception as e:
+        logger.exception("Identify error")
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
